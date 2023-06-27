@@ -79,6 +79,7 @@ module Obelisk.Route
   -- * Provided Encoders
   , enumEncoder
   , enum1Encoder
+  , isoEncoder
   , checkEnum1EncoderFunc
   , unitEncoder
   , pathOnlyEncoder
@@ -98,7 +99,6 @@ module Obelisk.Route
   , maybeToEitherEncoder
   , justEncoder
   , nothingEncoder
-  , isoEncoder
   , viewEncoder
   , wrappedEncoder
   , unwrappedEncoder
@@ -588,35 +588,6 @@ data SegmentResult check parse a =
     -- the given 'Text', and give an Encoder for translating the corresponding value into
     -- the remainder of the route.
 
--- | Encode a dependent sum of type `(R p)` into a PageName (i.e. the path and query part of a URL) by using the
--- supplied function to decide how to encode the constructors of p using the SegmentResult type. It is important
--- that the number of values of type `(Some p)` be relatively small in order for checking to complete quickly.
-pathComponentEncoder
-  :: forall check parse p.
-     ( Universe (Some p)
-     , GShow p
-     , GCompare p
-     , MonadError Text check
-     , MonadError Text parse )
-  => (forall a. p a -> SegmentResult check parse a)
-  -> Encoder check parse (R p) PageName
-pathComponentEncoder f = Encoder $ do
-  let extractEncoder = \case
-        PathEnd e -> first (unitEncoder []) . coidl . e
-        PathSegment _ e -> e
-      extractPathSegment = \case
-        PathEnd _ -> Nothing
-        PathSegment t _ -> Just t
-  EncoderFunc f' <- checkEnum1EncoderFunc (extractEncoder . f)
-  unEncoder (pathComponentEncoderImpl (enum1Encoder (extractPathSegment . f)) f')
-
-pathComponentEncoderImpl :: forall check parse p. (Monad check, Monad parse)
-  => Encoder check parse (Some p) (Maybe Text)
-  -> (forall a. p a -> Encoder Identity parse a PageName)
-  -> Encoder check parse (R p) PageName
-pathComponentEncoderImpl =
-  chainEncoder (lensEncoder (\(_, b) a -> (a, b)) Prelude.fst consEncoder)
-
 --NOTE: Naming convention in this module is to always talk about things in the *encoding* direction, never in the *decoding* direction
 
 chainEncoder
@@ -834,6 +805,11 @@ prefixNonemptyTextEncoder p = Encoder $ pure $ EncoderImpl
 packTextEncoder :: (Applicative check, Applicative parse, IsText text) => Encoder check parse String text
 packTextEncoder = isoEncoder packed
 
+{-# DEPRECATED isoEncoder "Instead of 'isoEncoder f', use 'viewEncoder f'" #-}
+-- | Given a valid 'Iso' from lens, construct an 'Encoder'
+isoEncoder :: (Applicative check, Applicative parse) => Iso' a b -> Encoder check parse a b
+isoEncoder = viewEncoder
+
 unpackTextEncoder :: (Applicative check, Applicative parse, IsText text) => Encoder check parse text String
 unpackTextEncoder = isoEncoder unpacked
 
@@ -946,6 +922,42 @@ handleEncoder recover e = Encoder $ do
 --------------------------------------------------------------------------------
 -- Actual obelisk route info
 --------------------------------------------------------------------------------
+data JSaddleWarpRoute :: * -> * where
+  JSaddleWarpRoute_JavaScript :: JSaddleWarpRoute ()
+  JSaddleWarpRoute_WebSocket :: JSaddleWarpRoute ()
+  JSaddleWarpRoute_Sync :: JSaddleWarpRoute [Text]
+
+
+concat <$> mapM deriveRouteComponent
+  [ ''JSaddleWarpRoute ]
+
+
+-- | A type representing the various resource routes served by Obelisk. These can in principle map to any physical routes you want,
+-- but sane defaults are provided by 'resourceRouteSegment'
+data ResourceRoute :: * -> * where
+  ResourceRoute_Static :: ResourceRoute [Text] -- This [Text] represents the *path in our static files directory*, not necessarily the URL path that the asset gets served at (although that will often be "/static/this/text/thing")
+  ResourceRoute_Ghcjs :: ResourceRoute [Text]
+  ResourceRoute_JSaddleWarp :: ResourceRoute (R JSaddleWarpRoute)
+  ResourceRoute_Version :: ResourceRoute ()
+
+
+-- | A type which can represent Obelisk-specific resource routes, in addition to application specific routes which serve your
+-- frontend.
+data ObeliskRoute :: (* -> *) -> * -> * where
+  -- We need to have the `f a` as an argument here, because otherwise we have no way to specifically check for overlap between us and the given encoder
+  ObeliskRoute_App :: f a -> ObeliskRoute f a
+  ObeliskRoute_Resource :: ResourceRoute a -> ObeliskRoute f a
+
+concat <$> mapM deriveRouteComponent
+  [ ''ResourceRoute ]
+
+instance GShow appRoute => GShow (ObeliskRoute appRoute) where
+  gshowsPrec prec = \case
+    ObeliskRoute_App appRoute -> showParen (prec > 10) $
+      showString "ObeliskRoute_App " . gshowsPrec 11 appRoute
+    ObeliskRoute_Resource appRoute -> showParen (prec > 10) $
+      showString "ObeliskRoute_Resource " . gshowsPrec 11 appRoute
+
 
 -- | The typical full route type comprising all of an Obelisk application's routes.
 -- Parameterised by the top level GADTs that define backend and frontend routes, respectively.
@@ -973,6 +985,67 @@ instance  (UniverseSome br, UniverseSome fr) => UniverseSome (FullRoute br fr) w
   universeSome = [Some (FullRoute_Backend x) | Some x <- universeSome]
               ++ [Some (FullRoute_Frontend x) | Some x <- universeSome]
 
+-- | Encode a dependent sum of type `(R p)` into a PageName (i.e. the path and query part of a URL) by using the
+-- supplied function to decide how to encode the constructors of p using the SegmentResult type. It is important
+-- that the number of values of type `(Some p)` be relatively small in order for checking to complete quickly.
+pathComponentEncoder
+  :: forall check parse p.
+     ( Universe (Some p)
+     , GShow p
+     , GCompare p
+     , MonadError Text check
+     , MonadError Text parse )
+  => (forall a. p a -> SegmentResult check parse a)
+  -> Encoder check parse (R p) PageName
+pathComponentEncoder f = Encoder $ do
+  let extractEncoder = \case
+        PathEnd e -> first (unitEncoder []) . coidl . e
+        PathSegment _ e -> e
+      extractPathSegment = \case
+        PathEnd _ -> Nothing
+        PathSegment t _ -> Just t
+  EncoderFunc f' <- checkEnum1EncoderFunc (extractEncoder . f)
+  unEncoder (pathComponentEncoderImpl (enum1Encoder (extractPathSegment . f)) f')
+
+pathComponentEncoderImpl :: forall check parse p. (Monad check, Monad parse)
+  => Encoder check parse (Some p) (Maybe Text)
+  -> (forall a. p a -> Encoder Identity parse a PageName)
+  -> Encoder check parse (R p) PageName
+pathComponentEncoderImpl =
+  chainEncoder (lensEncoder (\(_, b) a -> (a, b)) Prelude.fst consEncoder)
+
+
+
+jsaddleWarpRouteEncoder :: (MonadError Text check, MonadError Text parse) => Encoder check parse (R JSaddleWarpRoute) PageName
+jsaddleWarpRouteEncoder = pathComponentEncoder $ \case
+  JSaddleWarpRoute_JavaScript -> PathSegment "jsaddle.js" $ unitEncoder mempty
+  JSaddleWarpRoute_WebSocket ->  PathEnd $ unitEncoder mempty
+  JSaddleWarpRoute_Sync -> PathSegment "sync" pathOnlyEncoder
+
+
+-- | A function which gives a sane default for how to encode Obelisk resource routes. It's given in this form, because it will
+-- be combined with other such segment encoders before 'pathComponentEncoder' turns it into a proper 'Encoder'.
+resourceRouteSegment :: (MonadError Text check, MonadError Text parse) => ResourceRoute a -> SegmentResult check parse a
+resourceRouteSegment = \case
+  ResourceRoute_Static -> PathSegment "static" pathOnlyEncoderIgnoringQuery
+  ResourceRoute_Ghcjs -> PathSegment "ghcjs" pathOnlyEncoder
+  ResourceRoute_JSaddleWarp -> PathSegment "jsaddle" jsaddleWarpRouteEncoder
+  ResourceRoute_Version -> PathSegment "version" $ unitEncoder mempty
+
+
+-- | From a function which explains how app-specific frontend routes translate into segments, produce a function which does the
+-- same for ObeliskRoute. This uses the given function for the 'ObeliskRoute_App' case, and 'resourceRouteSegment' for the
+-- 'ObeliskRoute_Resource' case.
+obeliskRouteSegment :: forall check parse appRoute a.
+     (MonadError Text check, MonadError Text parse)
+  => ObeliskRoute appRoute a
+  -> (forall b. appRoute b -> SegmentResult check parse b)
+  -> SegmentResult check parse a
+obeliskRouteSegment r appRouteSegment = case r of
+  ObeliskRoute_App appRoute -> appRouteSegment appRoute
+  ObeliskRoute_Resource resourceRoute -> resourceRouteSegment resourceRoute
+
+
 -- | Build the typical top level application route encoder from a route for handling 404's,
 -- and segment encoders for backend and frontend routes.
 mkFullRouteEncoder
@@ -986,18 +1059,7 @@ mkFullRouteEncoder missing backendSegment frontendSegment = handleEncoder (const
     FullRoute_Backend backendRoute -> backendSegment backendRoute
     FullRoute_Frontend obeliskRoute -> obeliskRouteSegment obeliskRoute frontendSegment
 
--- | A type which can represent Obelisk-specific resource routes, in addition to application specific routes which serve your
--- frontend.
-data ObeliskRoute :: (* -> *) -> * -> * where
-  -- We need to have the `f a` as an argument here, because otherwise we have no way to specifically check for overlap between us and the given encoder
-  ObeliskRoute_App :: f a -> ObeliskRoute f a
-  ObeliskRoute_Resource :: ResourceRoute a -> ObeliskRoute f a
 
-instance UniverseSome f => UniverseSome (ObeliskRoute f) where
-  universeSome = concat
-    [ (\(Some x) -> Some (ObeliskRoute_App x)) <$> universe
-    , (\(Some x) -> Some (ObeliskRoute_Resource x)) <$> (universe @(Some ResourceRoute))
-    ]
 
 instance GEq f => GEq (ObeliskRoute f) where
   geq (ObeliskRoute_App x) (ObeliskRoute_App y) = geq x y
@@ -1010,13 +1072,11 @@ instance GCompare f => GCompare (ObeliskRoute f) where
   gcompare (ObeliskRoute_App _) (ObeliskRoute_Resource _) = GLT
   gcompare (ObeliskRoute_Resource _) (ObeliskRoute_App _) = GGT
 
--- | A type representing the various resource routes served by Obelisk. These can in principle map to any physical routes you want,
--- but sane defaults are provided by 'resourceRouteSegment'
-data ResourceRoute :: * -> * where
-  ResourceRoute_Static :: ResourceRoute [Text] -- This [Text] represents the *path in our static files directory*, not necessarily the URL path that the asset gets served at (although that will often be "/static/this/text/thing")
-  ResourceRoute_Ghcjs :: ResourceRoute [Text]
-  ResourceRoute_JSaddleWarp :: ResourceRoute (R JSaddleWarpRoute)
-  ResourceRoute_Version :: ResourceRoute ()
+instance UniverseSome f => UniverseSome (ObeliskRoute f) where
+  universeSome = concat
+    [ (\(Some x) -> Some (ObeliskRoute_App x)) <$> universe
+    , (\(Some x) -> Some (ObeliskRoute_Resource x)) <$> (universe @(Some ResourceRoute))
+    ]
 
 -- | If there are no additional backend routes in your app (i.e. ObeliskRoute gives you all the routes you need),
 -- this constructs a suitable 'Encoder' to use for encoding routes to 'PageName's. If you do have additional backend routes,
@@ -1034,51 +1094,15 @@ obeliskRouteEncoder :: forall check parse appRoute.
 obeliskRouteEncoder appRouteSegment = pathComponentEncoder $ \r ->
   obeliskRouteSegment r appRouteSegment
 
--- | From a function which explains how app-specific frontend routes translate into segments, produce a function which does the
--- same for ObeliskRoute. This uses the given function for the 'ObeliskRoute_App' case, and 'resourceRouteSegment' for the
--- 'ObeliskRoute_Resource' case.
-obeliskRouteSegment :: forall check parse appRoute a.
-     (MonadError Text check, MonadError Text parse)
-  => ObeliskRoute appRoute a
-  -> (forall b. appRoute b -> SegmentResult check parse b)
-  -> SegmentResult check parse a
-obeliskRouteSegment r appRouteSegment = case r of
-  ObeliskRoute_App appRoute -> appRouteSegment appRoute
-  ObeliskRoute_Resource resourceRoute -> resourceRouteSegment resourceRoute
-
--- | A function which gives a sane default for how to encode Obelisk resource routes. It's given in this form, because it will
--- be combined with other such segment encoders before 'pathComponentEncoder' turns it into a proper 'Encoder'.
-resourceRouteSegment :: (MonadError Text check, MonadError Text parse) => ResourceRoute a -> SegmentResult check parse a
-resourceRouteSegment = \case
-  ResourceRoute_Static -> PathSegment "static" pathOnlyEncoderIgnoringQuery
-  ResourceRoute_Ghcjs -> PathSegment "ghcjs" pathOnlyEncoder
-  ResourceRoute_JSaddleWarp -> PathSegment "jsaddle" jsaddleWarpRouteEncoder
-  ResourceRoute_Version -> PathSegment "version" $ unitEncoder mempty
-
-data JSaddleWarpRoute :: * -> * where
-  JSaddleWarpRoute_JavaScript :: JSaddleWarpRoute ()
-  JSaddleWarpRoute_WebSocket :: JSaddleWarpRoute ()
-  JSaddleWarpRoute_Sync :: JSaddleWarpRoute [Text]
-
-jsaddleWarpRouteEncoder :: (MonadError Text check, MonadError Text parse) => Encoder check parse (R JSaddleWarpRoute) PageName
-jsaddleWarpRouteEncoder = pathComponentEncoder $ \case
-  JSaddleWarpRoute_JavaScript -> PathSegment "jsaddle.js" $ unitEncoder mempty
-  JSaddleWarpRoute_WebSocket ->  PathEnd $ unitEncoder mempty
-  JSaddleWarpRoute_Sync -> PathSegment "sync" pathOnlyEncoder
-
-instance GShow appRoute => GShow (ObeliskRoute appRoute) where
-  gshowsPrec prec = \case
-    ObeliskRoute_App appRoute -> showParen (prec > 10) $
-      showString "ObeliskRoute_App " . gshowsPrec 11 appRoute
-    ObeliskRoute_Resource appRoute -> showParen (prec > 10) $
-      showString "ObeliskRoute_Resource " . gshowsPrec 11 appRoute
-
 data IndexOnlyRoute :: * -> * where
   IndexOnlyRoute :: IndexOnlyRoute ()
 
 indexOnlyRouteSegment :: (Applicative check, MonadError Text parse) => IndexOnlyRoute a -> SegmentResult check parse a
 indexOnlyRouteSegment = \case
   IndexOnlyRoute -> PathEnd $ unitEncoder mempty
+
+concat <$> mapM deriveRouteComponent
+  [ ''IndexOnlyRoute ]
 
 indexOnlyRouteEncoder :: (MonadError Text check, MonadError Text parse) => Encoder check parse (R IndexOnlyRoute) PageName
 indexOnlyRouteEncoder = pathComponentEncoder indexOnlyRouteSegment
@@ -1259,11 +1283,6 @@ byteStringsToPageName p q =
 --TODO: decodeURIComponent as appropriate
 
 
-{-# DEPRECATED isoEncoder "Instead of 'isoEncoder f', use 'viewEncoder f'" #-}
--- | Given a valid 'Iso' from lens, construct an 'Encoder'
-isoEncoder :: (Applicative check, Applicative parse) => Iso' a b -> Encoder check parse a b
-isoEncoder = viewEncoder
-
 {-# DEPRECATED prismEncoder "Instead of 'prismEncoder f', use 'reviewEncoder f'" #-}
 -- | An encoder that only works on the items available via the prism. An error will be thrown in the parse monad
 -- if the prism doesn't match.
@@ -1278,11 +1297,11 @@ prismEncoder :: (Applicative check, MonadError Text parse) => Prism' b a -> Enco
 prismEncoder = reviewEncoder
 
 
-concat <$> mapM deriveRouteComponent
-  [ ''ResourceRoute
-  , ''JSaddleWarpRoute
-  , ''IndexOnlyRoute
-  ]
+--concat <$> mapM deriveRouteComponent
+--  [ -- ''ResourceRoute
+--   ''JSaddleWarpRoute
+--  --, ''IndexOnlyRoute
+--  ]
 
 makePrisms ''ObeliskRoute
 makePrisms ''FullRoute
