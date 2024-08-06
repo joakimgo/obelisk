@@ -137,6 +137,8 @@ import Control.Categorical.Bifunctor
 import Control.Category.Associative
 import Control.Category.Monoidal
 import Control.Category.Braided
+import Control.Monad ((<=<), forM)
+import Control.Monad.Trans.Class (lift)
 import Control.Lens
   ( Identity (..)
   , (^.)
